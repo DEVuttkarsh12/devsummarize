@@ -1,42 +1,122 @@
-// Elements
+// --- Core Summarization Logic (Duplicated for standalone popup support) ---
+function splitSentences(text) {
+  if (!text) return [];
+  return (text.replace(/\n+/g, " ").match(/[^.!?]+[.!?]*/g) || [text]).map(s => s.trim());
+}
+
+function tokenize(s) {
+  return s.toLowerCase().replace(/[^a-z0-9_]+/g, " ").split(/\s+/).filter(Boolean);
+}
+
+function jaccard(a, b) {
+  const A = new Set(tokenize(a));
+  const B = new Set(tokenize(b));
+  const inter = [...A].filter(x => B.has(x)).length;
+  const union = new Set([...A, ...B]).size || 1;
+  return inter / union;
+}
+
+function rankSentences(sentences) {
+  const n = sentences.length;
+  if (n === 0) return [];
+  if (n <= 3) return sentences.map((t, i) => ({ i, score: 1, text: t }));
+  const W = Array.from({ length: n }, () => new Array(n).fill(0));
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      if (i !== j) W[i][j] = jaccard(sentences[i], sentences[j]);
+    }
+  }
+  let scores = new Array(n).fill(1);
+  const damping = 0.85;
+  for (let it = 0; it < 8; it++) {
+    const newScores = new Array(n).fill(1 - damping);
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < n; j++) {
+        const out = W[j].reduce((a, b) => a + b, 0) || 1;
+        if (W[j][i] > 0) newScores[i] += damping * (W[j][i] / out) * scores[j];
+      }
+    }
+    scores = newScores;
+  }
+  return sentences.map((text, i) => ({ i, score: scores[i], text }));
+}
+
+function localSummarize(text, k = 4) {
+  const sents = splitSentences(text).filter(s => s.length > 20);
+  if (sents.length === 0) return text.substring(0, 200) + "...";
+  const ranked = rankSentences(sents).sort((a, b) => b.score - a.score).slice(0, Math.min(k, sents.length));
+  ranked.sort((a, b) => a.i - b.i);
+  return ranked.map(x => x.text).join(" ");
+}
+
+async function aiSummarize(text) {
+  if (!window.ai?.summarizer) return null;
+  try {
+    const capabilities = await window.ai.summarizer.capabilities();
+    if (capabilities.available === "no") return null;
+    const summarizer = await window.ai.summarizer.create({ type: "key-points", format: "plain-text", length: "medium" });
+    const result = await summarizer.summarize(text);
+    summarizer.destroy();
+    return result;
+  } catch (err) {
+    console.warn("AI Summarizer failed:", err);
+    return null;
+  }
+}
+
+async function runSummarization(text) {
+  const aiResult = await aiSummarize(text);
+  return aiResult || localSummarize(text);
+}
+
+// --- UI Logic ---
+const summarizeTab = document.getElementById("summarizeTab");
+const historyTab = document.getElementById("historyTab");
+const summarizeView = document.getElementById("summarizeView");
+const historyView = document.getElementById("historyView");
 const summarizeBtn = document.getElementById("summarizeBtn");
 const summarizeManualBtn = document.getElementById("summarizeManualBtn");
 const manualText = document.getElementById("manualText");
 const resultDiv = document.getElementById("result");
-const copyBtn = document.getElementById("copyBtn");
-const openREADME = document.getElementById("openREADME");
-const clearHistory = document.getElementById("clearHistory");
 const historyList = document.getElementById("historyList");
-const tabLinks = document.querySelectorAll(".tab-link");
-const tabContents = document.querySelectorAll(".tab-content");
+const clearHistory = document.getElementById("clearHistory");
+const copyBtn = document.getElementById("copyBtn");
 const aiStatus = document.getElementById("aiStatus");
-const aiLabel = document.getElementById("aiLabel");
 
-// State
-let currentHistory = [];
+let history = [];
 
-// Initialize
-document.addEventListener("DOMContentLoaded", () => {
-    loadHistory();
-    setupTabs();
+document.addEventListener("DOMContentLoaded", async () => {
+    const data = await chrome.storage.local.get("history");
+    history = data.history || [];
+    checkAI();
 });
 
-// Tab Logic
-function setupTabs() {
-    tabLinks.forEach(link => {
-        link.addEventListener("click", () => {
-            const target = link.dataset.tab;
-            
-            tabLinks.forEach(l => l.classList.remove("active"));
-            tabContents.forEach(c => c.classList.remove("active"));
-            
-            link.classList.add("active");
-            document.getElementById(target).classList.add("active");
-            
-            if (target === "history") renderHistory();
-        });
-    });
+async function checkAI() {
+    if (window.ai?.summarizer) {
+        const caps = await window.ai.summarizer.capabilities();
+        if (caps.available !== "no") {
+            aiStatus.textContent = "AI ready";
+            return;
+        }
+    }
+    aiStatus.textContent = "Offline engine";
 }
+
+// Tabs
+summarizeTab.onclick = () => {
+    summarizeTab.classList.add("active");
+    historyTab.classList.remove("active");
+    summarizeView.classList.remove("hidden");
+    historyView.classList.add("hidden");
+};
+
+historyTab.onclick = () => {
+    historyTab.classList.add("active");
+    summarizeTab.classList.remove("active");
+    historyView.classList.remove("hidden");
+    summarizeView.classList.add("hidden");
+    renderHistory();
+};
 
 async function getActiveTab() {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -45,46 +125,15 @@ async function getActiveTab() {
 
 async function ensureContentScript(tabId) {
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["content.js"],
-    });
-  } catch (err) {
-    console.warn("⚠️ Content script injection failed:", err);
-  }
-}
-
-function sendSummaryRequest(tabId, text = "") {
-  chrome.tabs.sendMessage(
-    tabId,
-    { type: "DEV_SUMMARY_REQUEST", text },
-    (response) => {
-      if (chrome.runtime.lastError) {
-        resultDiv.innerHTML = `<p class="error-text">Could not connect to page. Try reloading.</p>`;
-        return;
-      }
-
-      if (!response) {
-        resultDiv.innerHTML = `<p class="error-text">No response received.</p>`;
-        return;
-      }
-
-      if (response.ok) {
-        const { summary, codeBlocks } = response.result;
-        displayResult(summary, codeBlocks);
-        saveToHistory(summary, codeBlocks, text);
-      } else {
-        resultDiv.innerHTML = `<p class="error-text">Error: ${response.error || "unknown"}</p>`;
-      }
-    },
-  );
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+  } catch {}
 }
 
 function displayResult(summary, codeBlocks) {
-    let html = `<div class="summary-text">${summary || "No summary generated."}</div>`;
+    let html = `<div class="summary-text">${summary}</div>`;
     if (codeBlocks?.length) {
         html += `<div class="code-blocks-section">
-            <h5>Code Snippets</h5>
+            <h5>Snippets</h5>
             ${codeBlocks.map(c => `<pre><code>${escapeHtml(c)}</code></pre>`).join("")}
         </div>`;
     }
@@ -97,93 +146,77 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-// History Management
-async function loadHistory() {
-    const data = await chrome.storage.local.get("history");
-    currentHistory = data.history || [];
-}
-
-async function saveToHistory(summary, codeBlocks, originalText) {
-    const newItem = {
-        id: Date.now(),
-        date: new Date().toLocaleString(),
-        summary,
-        codeBlocks,
-        preview: summary.substring(0, 100) + "..."
-    };
-    
-    currentHistory.unshift(newItem);
-    if (currentHistory.length > 20) currentHistory.pop(); // Keep last 20
-    
-    await chrome.storage.local.set({ history: currentHistory });
+async function saveHistory(summary, codeBlocks) {
+    const item = { id: Date.now(), date: new Date().toLocaleTimeString(), summary, codeBlocks };
+    history.unshift(item);
+    if (history.length > 20) history.pop();
+    await chrome.storage.local.set({ history });
 }
 
 function renderHistory() {
-    if (currentHistory.length === 0) {
-        historyList.innerHTML = `<p class="placeholder-text">No history yet.</p>`;
+    if (history.length === 0) {
+        historyList.innerHTML = `<div class="empty-state">No history.</div>`;
         return;
     }
-    
-    historyList.innerHTML = currentHistory.map(item => `
+    historyList.innerHTML = history.map(item => `
         <div class="history-item" data-id="${item.id}">
-            <div class="history-item-date">${item.date}</div>
-            <div class="history-item-text">${escapeHtml(item.summary)}</div>
+            <div class="history-date">${item.date}</div>
+            <div class="history-preview">${escapeHtml(item.summary)}</div>
         </div>
     `).join("");
     
-    // Add click events to history items
     document.querySelectorAll(".history-item").forEach(el => {
-        el.addEventListener("click", () => {
-            const id = parseInt(el.dataset.id);
-            const item = currentHistory.find(i => i.id === id);
+        el.onclick = () => {
+            const item = history.find(i => i.id == el.dataset.id);
             if (item) {
-                // Switch to summarize tab and show result
-                document.querySelector('[data-tab="summarize"]').click();
+                summarizeTab.click();
                 displayResult(item.summary, item.codeBlocks);
             }
-        });
+        };
     });
 }
 
-clearHistory.addEventListener("click", async () => {
-    currentHistory = [];
-    await chrome.storage.local.set({ history: [] });
-    renderHistory();
-});
-
-// Event Listeners
-summarizeBtn.addEventListener("click", async () => {
-  resultDiv.innerHTML = `<div class="loading-spinner">⏳ Processing with Local AI...</div>`;
+summarizeBtn.onclick = async () => {
   const tab = await getActiveTab();
   if (!tab || !/^https?:\/\//.test(tab.url)) {
-    resultDiv.innerHTML = `<p class="error-text">Cannot summarize this page.</p>`;
+    resultDiv.innerHTML = `<div class="empty-state">Can't read this page. Try 'Paste' instead.</div>`;
     return;
   }
-
+  
+  resultDiv.innerHTML = `<div class="empty-state">Analyzing...</div>`;
   await ensureContentScript(tab.id);
-  setTimeout(() => sendSummaryRequest(tab.id), 300);
-});
-
-summarizeManualBtn.addEventListener("click", async () => {
-  const text = manualText.value.trim();
-  if (!text) return;
-
-  resultDiv.innerHTML = `<div class="loading-spinner">⏳ Processing...</div>`;
-  const tab = await getActiveTab();
-  await ensureContentScript(tab.id);
-  setTimeout(() => sendSummaryRequest(tab.id, text), 300);
-});
-
-copyBtn.addEventListener("click", () => {
-  const txt = resultDiv.innerText;
-  if (!txt || txt.includes("Run a summary")) return;
-  navigator.clipboard.writeText(txt).then(() => {
-    const originalIcon = copyBtn.textContent;
-    copyBtn.textContent = "✅";
-    setTimeout(() => (copyBtn.textContent = originalIcon), 1200);
+  
+  chrome.tabs.sendMessage(tab.id, { type: "DEV_SUMMARY_REQUEST" }, async (res) => {
+    if (res?.ok) {
+        displayResult(res.result.summary, res.result.codeBlocks);
+        saveHistory(res.result.summary, res.result.codeBlocks);
+    } else {
+        resultDiv.innerHTML = `<div class="empty-state">Error: ${res?.error || "Connection failed"}</div>`;
+    }
   });
-});
+};
 
-openREADME.addEventListener("click", () => {
-  chrome.tabs.create({ url: "https://github.com/YOUR-USERNAME/YOUR-REPO" });
-});
+summarizeManualBtn.onclick = async () => {
+    const text = manualText.value.trim();
+    if (!text) return;
+    
+    resultDiv.innerHTML = `<div class="empty-state">Processing...</div>`;
+    const summary = await runSummarization(text);
+    displayResult(summary, []);
+    saveHistory(summary, []);
+};
+
+copyBtn.onclick = () => {
+    const text = resultDiv.innerText;
+    if (text.includes("Results will appear")) return;
+    navigator.clipboard.writeText(text);
+    const old = copyBtn.textContent;
+    copyBtn.textContent = "Saved";
+    setTimeout(() => copyBtn.textContent = old, 1000);
+};
+
+clearHistory.onclick = async () => {
+    history = [];
+    await chrome.storage.local.set({ history: [] });
+    renderHistory();
+};
